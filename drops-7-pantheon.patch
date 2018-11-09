@@ -1,0 +1,257 @@
+diff -x .git -Nupr pressflow7/includes/bootstrap.inc drops-7/includes/bootstrap.inc
+--- pressflow7/includes/bootstrap.inc	2018-11-09 11:44:19.000000000 -0800
++++ drops-7/includes/bootstrap.inc	2018-11-09 11:12:18.000000000 -0800
+@@ -758,6 +758,15 @@ function drupal_settings_initialize() {
+           $conf[$conf_key] = $conf_value;
+         }
+       }
++      elseif ($key == 'databases') {
++        // Protect default configuration but allow the specification of
++        // additional databases. Also, allows fun things with 'prefix' if they
++        // want to try multisite.
++        if (!isset($databases) || !is_array($databases)) {
++          $databases = array();
++        }
++        $databases = array_replace_recursive($databases, $value);
++      }
+       else {
+         $$key = $value;
+       }
+@@ -2775,10 +2784,15 @@ function _drupal_bootstrap_variables() {
+   if (!empty($GLOBALS['databases']) && variable_get('pressflow_smart_start', FALSE)) {
+     try {
+       $result = db_query('SELECT s.name FROM {system} s WHERE s.name = :name', array(':name' => 'system'));
+-    } catch (Exception $e) {
+-      // Redirect to the installer if an essential table is missing.
+-      include_once DRUPAL_ROOT . '/includes/install.inc';
+-      install_goto('install.php');
++    } catch (PDOException $e) {
++      if ($e->getCode() == '2003') {
++        header('Status: 550 Database Offline');
++        exit();
++      }
++      elseif ($e->getCode() == '42S02') {
++        include_once DRUPAL_ROOT . '/includes/install.inc';
++        install_goto('install.php');
++      }
+     }
+   }
+ 
+diff -x .git -Nupr pressflow7/includes/common.inc drops-7/includes/common.inc
+--- pressflow7/includes/common.inc	2018-11-09 11:44:19.000000000 -0800
++++ drops-7/includes/common.inc	2018-11-09 11:12:18.000000000 -0800
+@@ -5059,17 +5059,16 @@ function drupal_add_tabledrag($table_id,
+ }
+ 
+ function drupal_aggregated_file_exists($uri) {
+-  if (function_exists('apc_fetch')) {
+-    $exists = apc_fetch('file_exists_' . $uri);
++  if (function_exists('apc_exists')) {
++    $exists = apc_exists('file_exists_' . $uri);
+     if (!$exists && file_exists($uri)) {
+       $exists = TRUE;
+       apc_store('file_exists_' . $uri, TRUE, 86400);
+     }
++    return $exists;
+   }
+-  else {
+-    $exists = file_exists($uri);
+-  }
+-  return $exists;
++  // If no APC available, fall back to default.
++  return file_exists($uri);
+ }
+ 
+ /**
+diff -x .git -Nupr pressflow7/includes/file.inc drops-7/includes/file.inc
+--- pressflow7/includes/file.inc	2018-11-09 11:44:19.000000000 -0800
++++ drops-7/includes/file.inc	2018-11-09 11:12:18.000000000 -0800
+@@ -477,6 +477,10 @@ function file_ensure_htaccess() {
+  *   already present. Defaults to FALSE.
+  */
+ function file_create_htaccess($directory, $private = TRUE, $force_overwrite = FALSE) {
++  if (isset($_ENV['PANTHEON_ENVIRONMENT'])) {
++    // Skip on Pantheon since we use nginx and this can hang.
++    return;
++  }
+   if (file_uri_scheme($directory)) {
+     $directory = file_stream_wrapper_uri_normalize($directory);
+   }
+diff -x .git -Nupr pressflow7/includes/stream_wrappers.inc drops-7/includes/stream_wrappers.inc
+--- pressflow7/includes/stream_wrappers.inc	2018-11-09 11:42:28.000000000 -0800
++++ drops-7/includes/stream_wrappers.inc	2017-05-31 11:50:44.000000000 -0700
+@@ -829,16 +829,32 @@ abstract class DrupalLocalStreamWrapper 
+    * @see http://php.net/manual/streamwrapper.url-stat.php
+    */
+   public function url_stat($uri, $flags) {
++    // Cache existence checks for ctools_css_retrieve.
++    $store_to_cache = FALSE;
++    if (strpos($uri, 'public://ctools/css/') === 0 && function_exists('pantheon_cache_get')) {
++      $stat = pantheon_cache_get('file_stat_' . $uri);
++      if ($stat !== FALSE) {
++        return $stat;
++      }
++      $store_to_cache = TRUE;
++    }
++
+     $this->uri = $uri;
+     $path = $this->getLocalPath();
+     // Suppress warnings if requested or if the file or directory does not
+     // exist. This is consistent with PHP's plain filesystem stream wrapper.
+     if ($flags & STREAM_URL_STAT_QUIET || !file_exists($path)) {
+-      return @stat($path);
++      $stat = @stat($path);
+     }
+     else {
+-      return stat($path);
++      $stat = stat($path);
+     }
++
++    if ($store_to_cache && $stat !== FALSE) {
++      pantheon_cache_set('file_stat_' . $uri, $stat, 86400);
++    }
++
++    return $stat;
+   }
+ 
+   /**
+diff -x .git -Nupr pressflow7/modules/image/image.module drops-7/modules/image/image.module
+--- pressflow7/modules/image/image.module	2018-11-09 11:42:28.000000000 -0800
++++ drops-7/modules/image/image.module	2016-11-16 16:11:30.000000000 -0800
+@@ -546,6 +546,11 @@ function image_field_update_instance($in
+  *   The Drupal file path to the original image.
+  */
+ function image_path_flush($path) {
++  // Pantheon optimization: one bulk operation is better.
++  if (function_exists('pantheon_api_image_path_flush') && function_exists('pantheon_bulk_file_delete')) {
++    pantheon_api_image_path_flush($path);
++    return;
++  }
+   $styles = image_styles();
+   foreach ($styles as $style) {
+     $image_path = image_style_path($style['name'], $path);
+diff -x .git -Nupr pressflow7/modules/system/system.install drops-7/modules/system/system.install
+--- pressflow7/modules/system/system.install	2018-11-09 11:42:28.000000000 -0800
++++ drops-7/modules/system/system.install	2017-06-21 13:12:36.000000000 -0700
+@@ -236,8 +236,18 @@ function system_requirements($phase) {
+ 
+   // Test settings.php file writability
+   if ($phase == 'runtime') {
+-    $conf_dir = drupal_verify_install_file(conf_path(), FILE_NOT_WRITABLE, 'dir');
+-    $conf_file = drupal_verify_install_file(conf_path() . '/settings.php', FILE_EXIST|FILE_READABLE|FILE_NOT_WRITABLE);
++    // Pantheon handles permissions automatically.
++    if (defined('PANTHEON_ENVIRONMENT')) {
++      // Do not alter sites/default permissions.
++      $conf_dir = TRUE;
++      // Ensure settings.php exists.
++      $conf_file = drupal_verify_install_file(conf_path() . '/settings.php', FILE_EXIST);
++    }
++    // Drupal core logic.
++    else {
++      $conf_dir = drupal_verify_install_file(conf_path(), FILE_NOT_WRITABLE, 'dir');
++      $conf_file = drupal_verify_install_file(conf_path() . '/settings.php', FILE_EXIST|FILE_READABLE|FILE_NOT_WRITABLE);
++    }
+     if (!$conf_dir || !$conf_file) {
+       $requirements['settings.php'] = array(
+         'value' => $t('Not protected'),
+@@ -248,7 +258,12 @@ function system_requirements($phase) {
+         $requirements['settings.php']['description'] .= $t('The directory %file is not protected from modifications and poses a security risk. You must change the directory\'s permissions to be non-writable. ', array('%file' => conf_path()));
+       }
+       if (!$conf_file) {
+-        $requirements['settings.php']['description'] .= $t('The file %file is not protected from modifications and poses a security risk. You must change the file\'s permissions to be non-writable.', array('%file' => conf_path() . '/settings.php'));
++        if (defined('PANTHEON_ENVIRONMENT')) {
++          $requirements['settings.php']['description'] .= $t('The file %file does not exist. Please add one to your site codebase by copying default.settings.php to settings.php.', array('%file' => conf_path() . '/settings.php'));
++        }
++        else {
++          $requirements['settings.php']['description'] .= $t('The file %file is not protected from modifications and poses a security risk. You must change the file\'s permissions to be non-writable.', array('%file' => conf_path() . '/settings.php'));
++        }
+       }
+     }
+     else {
+@@ -280,8 +295,8 @@ function system_requirements($phase) {
+     );
+     foreach ($htaccess_files as $htaccess_file => $info) {
+       // Check for the string which was added to the recommended .htaccess file
+-      // in the latest security update.
+-      if (!file_exists($htaccess_file) || !($contents = @file_get_contents($htaccess_file)) || strpos($contents, 'Drupal_Security_Do_Not_Remove_See_SA_2013_003') === FALSE) {
++      // in the latest security update. Skipped on Pantheon where it has no effect.
++      if (!defined('PANTHEON_ENVIRONMENT') && (!file_exists($htaccess_file) || !($contents = @file_get_contents($htaccess_file)) || strpos($contents, 'Drupal_Security_Do_Not_Remove_See_SA_2013_003') === FALSE)) {
+         $requirements[$htaccess_file] = array(
+           'title' => $info['title'],
+           'value' => $t('Not fully protected'),
+diff -x .git -Nupr pressflow7/modules/update/update.compare.inc drops-7/modules/update/update.compare.inc
+--- pressflow7/modules/update/update.compare.inc	2018-11-09 11:42:28.000000000 -0800
++++ drops-7/modules/update/update.compare.inc	2017-05-31 11:50:44.000000000 -0700
+@@ -176,6 +176,7 @@ function _update_process_info_list(&$pro
+     // section at the top of the report.
+     if ($project_name == 'drupal') {
+       $project_display_type = 'core';
++      $file->info['version'] = VERSION;
+     }
+     else {
+       $project_display_type = $project_type;
+diff -x .git -Nupr pressflow7/modules/update/update.module drops-7/modules/update/update.module
+--- pressflow7/modules/update/update.module	2018-11-09 11:42:28.000000000 -0800
++++ drops-7/modules/update/update.module	2016-11-16 16:11:30.000000000 -0800
+@@ -520,18 +520,22 @@ function _update_get_cached_available_re
+  * @see drupal_mail()
+  * @see _update_cron_notify()
+  * @see _update_message_text()
++ *
++ * This function is updated by Pantheon to direct users to their dashboard for
++ * core updates. Hence the $core variable, etc.
+  */
+ function update_mail($key, &$message, $params) {
+   $language = $message['language'];
+   $langcode = $language->language;
++  $core = FALSE;
+   $message['subject'] .= t('New release(s) available for !site_name', array('!site_name' => variable_get('site_name', 'Drupal')), array('langcode' => $langcode));
+   foreach ($params as $msg_type => $msg_reason) {
++    if ($msg_type == 'core') {
++      $core = TRUE;
++    }
+     $message['body'][] = _update_message_text($msg_type, $msg_reason, FALSE, $language);
+   }
+   $message['body'][] = t('See the available updates page for more information:', array(), array('langcode' => $langcode)) . "\n" . url('admin/reports/updates', array('absolute' => TRUE, 'language' => $language));
+-  if (update_manager_access()) {
+-    $message['body'][] = t('You can automatically install your missing updates using the Update manager:', array(), array('langcode' => $langcode)) . "\n" . url('admin/reports/updates/update', array('absolute' => TRUE, 'language' => $language));
+-  }
+   $settings_url = url('admin/reports/updates/settings', array('absolute' => TRUE));
+   if (variable_get('update_notification_threshold', 'all') == 'all') {
+     $message['body'][] = t('Your site is currently configured to send these emails when any updates are available. To get notified only for security updates, !url.', array('!url' => $settings_url));
+@@ -539,6 +543,14 @@ function update_mail($key, &$message, $p
+   else {
+     $message['body'][] = t('Your site is currently configured to send these emails only when security updates are available. To get notified for any available updates, !url.', array('!url' => $settings_url));
+   }
++  if ($core) {
++    // Add Pantheon link to beginning/end of mesage.
++    // TODO: have the $dashboard link directly to the site.
++    $dashboard = 'https://dashboard.getpantheon.com/account';
++    $text = t('Drupal core updates should be performed directly from <a href="@link">your Pantheon dashboard</a>.', array('@link' => $dashboard));
++    array_unshift($message['body'], $text);
++    $message['body'][] = t('Core updates should be performed directly from your Pantheon dashboard:', array(), array('langcode' => $langcode)) ."\n$dashboard";
++  }
+ }
+ 
+ /**
+diff -x .git -Nupr pressflow7/profiles/minimal/minimal.info drops-7/profiles/minimal/minimal.info
+--- pressflow7/profiles/minimal/minimal.info	2018-11-09 11:42:28.000000000 -0800
++++ drops-7/profiles/minimal/minimal.info	2016-11-16 16:11:30.000000000 -0800
+@@ -2,5 +2,6 @@ name = Minimal
+ description = Start with only a few modules enabled.
+ version = VERSION
+ core = 7.x
++hidden = TRUE
+ dependencies[] = block
+ dependencies[] = dblog
+diff -x .git -Nupr pressflow7/profiles/standard/standard.info drops-7/profiles/standard/standard.info
+--- pressflow7/profiles/standard/standard.info	2018-11-09 11:42:28.000000000 -0800
++++ drops-7/profiles/standard/standard.info	2016-11-16 16:11:30.000000000 -0800
+@@ -2,6 +2,7 @@ name = Standard
+ description = Install with commonly used features pre-configured.
+ version = VERSION
+ core = 7.x
++hidden = TRUE
+ dependencies[] = block
+ dependencies[] = color
+ dependencies[] = comment
